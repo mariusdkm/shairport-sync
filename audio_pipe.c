@@ -33,6 +33,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <memory.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -44,6 +46,21 @@
 static int fd = -1;
 static int warned = 0;
 static unsigned int bytes_per_frame = 0;
+static unsigned int output_rate = 0;
+
+// Optional record framing: a 32-byte little-endian header before every payload, so the reader
+// knows when each frame should be played. Without a delay() method the player hands over every
+// buffer contiguously from its playtime, so a record's frames follow on from its should_be time.
+#define TIMING_HEADER_MAGIC 0x48545053 // "SPTH"
+#define TIMING_HEADER_VERSION 1
+#define TIMING_HEADER_SIZE 32
+enum { TIMING_FLAG_TIMED = 1, TIMING_FLAG_FLUSH = 2, TIMING_FLAG_STOP = 4 };
+
+static int timing_headers = 0;
+static uint8_t *record_buf = NULL;
+static size_t record_buf_size = 0;
+// flush() can come from another thread while the player thread writes
+static pthread_mutex_t record_lock = PTHREAD_MUTEX_INITIALIZER;
 
 char *pipename = NULL;
 char *default_pipe_name = "/tmp/shairport-sync-audio";
@@ -71,9 +88,70 @@ static int prepare() {
   return result;
 }
 
+static void put_le(uint8_t *p, uint64_t v, int bytes) {
+  for (int i = 0; i < bytes; i++)
+    p[i] = (v >> (8 * i)) & 0xFF;
+}
+
+static int write_record(uint16_t flags, const void *payload, int frames, uint32_t timestamp,
+                        uint64_t playtime) {
+  size_t payload_size = (size_t)frames * bytes_per_frame;
+  size_t size = TIMING_HEADER_SIZE + payload_size;
+  int rc = 0;
+  int oldState;
+  // a record cut short by cancellation would desync the reader, and stop() runs from the
+  // cancelled player thread's cleanup handler, so the lock must never be held at a cancellation
+  // point.
+  // The write below can therefore block uncancellably (and flush() on record_lock) while the
+  // pipe is full. The reader must always drain it: Music Assistant reads it from start-up,
+  // independent of any stream. A stalled reader holds up session teardown only until it reads
+  // again; a reader that is gone makes write() fail with EPIPE (SIGPIPE is ignored).
+  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldState);
+  pthread_mutex_lock(&record_lock);
+  if (size > record_buf_size) {
+    uint8_t *b = realloc(record_buf, size);
+    if (b == NULL) {
+      rc = -1;
+      errno = ENOMEM;
+      goto out;
+    }
+    record_buf = b;
+    record_buf_size = size;
+  }
+  put_le(record_buf + 0, TIMING_HEADER_MAGIC, 4);
+  put_le(record_buf + 4, TIMING_HEADER_VERSION, 2);
+  put_le(record_buf + 6, flags, 2);
+  put_le(record_buf + 8, frames, 4);
+  put_le(record_buf + 12, timestamp, 4);
+  put_le(record_buf + 16, playtime, 8);
+  put_le(record_buf + 24, output_rate, 4);
+  put_le(record_buf + 28, bytes_per_frame, 4);
+  if (payload_size)
+    memcpy(record_buf + TIMING_HEADER_SIZE, payload, payload_size);
+  for (size_t done = 0; done < size;) {
+    ssize_t n = write(fd, record_buf + done, size - done);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      rc = -1;
+      goto out;
+    }
+    done += n;
+    rc += n;
+  }
+out:
+  pthread_mutex_unlock(&record_lock);
+  pthread_setcancelstate(oldState, NULL);
+  return rc;
+}
+
+static void write_marker(uint16_t flags) {
+  if (timing_headers && fd > 0)
+    write_record(flags, NULL, 0, 0, 0);
+}
+
 static int play(void *buf, int samples, __attribute__((unused)) int sample_type,
-                __attribute__((unused)) uint32_t timestamp,
-                __attribute__((unused)) uint64_t playtime) {
+                uint32_t timestamp, uint64_t playtime) {
   // if the file is not open, try to open it.
   char errorstring[1024];
   if (fd == -1) {
@@ -84,7 +162,11 @@ static int play(void *buf, int samples, __attribute__((unused)) int sample_type,
     // int rc = non_blocking_write(fd, buf, samples * 4);
     if (bytes_per_frame == 0)
       debug(1, "pipe: bytes per frame not initialised before play()!");
-    int rc = write(fd, buf, samples * bytes_per_frame);
+    int rc;
+    if (timing_headers)
+      rc = write_record(playtime ? TIMING_FLAG_TIMED : 0, buf, samples, timestamp, playtime);
+    else
+      rc = write(fd, buf, samples * bytes_per_frame);
     if ((rc < 0) && (errno != EPIPE) && (warned == 0)) {
       strerror_r(errno, (char *)errorstring, 1024);
       debug(1, "error %d writing to the pipe named \"%s\": \"%s\".", errno, pipename, errorstring);
@@ -96,7 +178,10 @@ static int play(void *buf, int samples, __attribute__((unused)) int sample_type,
 
 static void stop(void) {
   // Don't close the pipe just because a play session has stopped.
+  write_marker(TIMING_FLAG_STOP);
 }
+
+static void flush(void) { write_marker(TIMING_FLAG_FLUSH); }
 
 static int init(int argc, char **argv) {
   //  debug(1, "pipe init");
@@ -124,6 +209,7 @@ static int init(int argc, char **argv) {
     } else {
       die("pipename needed");
     }
+    config_set_lookup_bool(config.cfg, "pipe.timing_headers", &timing_headers);
   }
 
   if (argc > 1)
@@ -144,12 +230,18 @@ static int init(int argc, char **argv) {
     die("Could not create audio pipe \"%s\"", pipename);
   umask(oldumask);
 
-  debug(1, "audio pipe name is \"%s\"", pipename);
+  debug(1, "audio pipe name is \"%s\"%s", pipename,
+        timing_headers ? ", with timing headers" : "");
 
   return 0;
 }
 
-static void deinit(void) { safe_socket_close(&fd); }
+static void deinit(void) {
+  safe_socket_close(&fd);
+  free(record_buf);
+  record_buf = NULL;
+  record_buf_size = 0;
+}
 
 static void help(void) {
   printf("    Provide the pipe's pathname. The default is \"%s\".\n", default_pipe_name);
@@ -172,6 +264,7 @@ static int configure(int32_t requested_encoded_format, __attribute__((unused)) c
     response = EINVAL;
   }
   bytes_per_frame = bytes_per_sample * CHANNELS_FROM_ENCODED_FORMAT(requested_encoded_format);
+  output_rate = RATE_FROM_ENCODED_FORMAT(requested_encoded_format);
   return response;
 }
 
@@ -184,7 +277,7 @@ audio_output audio_pipe = {.name = "pipe",
                            .configure = &configure,
                            .stop = &stop,
                            .is_running = NULL,
-                           .flush = NULL,
+                           .flush = &flush,
                            .delay = NULL,
                            .stats = NULL,
                            .play = &play,
